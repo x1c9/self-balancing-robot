@@ -31,8 +31,10 @@ float KalmanAnglePitch = 0, KalmanUncertaintyAnglePitch = 2*2;
 
 float Kalman1DOutput[] = {0, 0};
 
-float dt, timer = 0.0f;
-float prev_error, integral, kp, ki, kd;
+float dt;
+float prev_error;
+float integral, derivative;
+float kp, ki, kd;
 float throttle;
 
 void gyro_signals(void);
@@ -40,9 +42,9 @@ void gyro_signals(void);
 void kalman_1d(float KalmanState, float KalmanUncertainty, float KalmanInput, float KalmanMeasurement);
 
 void setup() {
-  kp = 1.0f;
-  ki = 1.0f;
-  kd = 1.0f;
+  kp = 10.0f;
+  ki = 0.0f;
+  kd = 0.0f;
 
   // Set all the motor control pins to outputs
   pinMode(ENA, OUTPUT);
@@ -86,8 +88,6 @@ void loop() {
   KalmanAnglePitch = Kalman1DOutput[0];
   KalmanUncertaintyAnglePitch = Kalman1DOutput[1];
 
-  Serial.print("Pitch angle [°] = ");
-  Serial.println(KalmanAnglePitch);
   pid();
   driveMotors();
   while (micros() - LoopTimer < 4000);
@@ -140,12 +140,12 @@ void gyro_signals(void) {
   AccZ = (float) AccZLSB / 4096 - 0.03;
 
   // Calculate the absolute angle
-  AnglePitch = -atan(AccX/sqrt(AccY*AccY + AccZ*AccZ)) * 1/(3.142/180); 
+  AnglePitch = -atan(AccX/sqrt(AccY*AccY + AccZ*AccZ)) * 57.29578; // ≈ 1/(3.142/180) 
 }
 
 void kalman_1d(float KalmanState, float KalmanUncertainty, float KalmanInput, float KalmanMeasurement) {
-  KalmanState = KalmanState + 0.004 * KalmanInput;
-  KalmanUncertainty = KalmanUncertainty + 0.004 * 0.004 * 4 * 4;
+  KalmanState = KalmanState + dt * KalmanInput;
+  KalmanUncertainty = KalmanUncertainty + dt * dt * 4 * 4;
   float KalmanGain = KalmanUncertainty * 1/(1 * KalmanUncertainty + 3 * 3);
   KalmanState = KalmanState + KalmanGain * (KalmanMeasurement - KalmanState);
   KalmanUncertainty = (1 - KalmanGain) * KalmanUncertainty;
@@ -155,17 +155,21 @@ void kalman_1d(float KalmanState, float KalmanUncertainty, float KalmanInput, fl
 }
 
 void pid(void) {
-  float error = (float)(-KalmanAnglePitch);
+  float error = -KalmanAnglePitch;
 
-  integral += error * dt;
-  integral = constrain(integral, -100, 100);
+  if (abs(error) > 45.0) { // Nếu góc nghiêng vượt quá 45 độ
+    throttle = 0.0; // Dừng động cơ
+    integral = 0.0; // Đặt lại tích phân để tránh windup
+  } else {
+    integral += error * dt;
+    integral = constrain(integral, -100, 100);
 
-  float derivative = (float)(error - prev_error) / dt;
-  prev_error = error;
+    derivative = 0.9 * derivative + 0.1 * (error - prev_error) / dt; // Low-pass filter
+    prev_error = error;
 
-  throttle = (float)(kp * error + ki * integral + kd * derivative);
-
-  throttle = constrain(throttle, -255.0f, 255.0f);
+    throttle = kp * error + ki * integral + kd * derivative;
+    throttle = constrain(throttle, -255, 255);
+  }
 }
 
 void driveMotors() {
