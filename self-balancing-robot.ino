@@ -1,5 +1,19 @@
 #include <Wire.h>
 
+#define IMU_ADDR 0x68
+
+// Motor A connections
+#define ENA 9
+#define IN1 8
+#define IN2 7
+
+// Motor B connections
+#define ENB 3
+#define IN3 5
+#define IN4 4
+
+const float MICROSECOND = 1000000.0f;
+
 // Declare the global variables
 float RatePitch;
 
@@ -17,45 +31,26 @@ float KalmanAnglePitch = 0, KalmanUncertaintyAnglePitch = 2*2;
 
 float Kalman1DOutput[] = {0, 0};
 
-double dt, last_time;
-double integral, previous, output = 0;
-double kp, ki, kd;
-double setpoint = 0.0;
-
-// Motor A connections
-int enA = 9;
-int in1 = 8;
-int in2 = 7;
-
-// Motor B connections
-int enB = 3;
-int in3 = 5;
-int in4 = 4;
+float dt, timer = 0.0f;
+float prev_error, integral, kp, ki, kd;
+float throttle;
 
 void gyro_signals(void);
 
 void kalman_1d(float KalmanState, float KalmanUncertainty, float KalmanInput, float KalmanMeasurement);
 
-double pid(double error);
-
 void setup() {
-  kp = 1;
-  ki = 0;
-  kd = 0;
+  kp = 1.0f;
+  ki = 1.0f;
+  kd = 1.0f;
 
   // Set all the motor control pins to outputs
-  pinMode(enA, OUTPUT);
-  pinMode(enB, OUTPUT);
-  pinMode(in1, OUTPUT);
-  pinMode(in2, OUTPUT);
-  pinMode(in3, OUTPUT);
-  pinMode(in4, OUTPUT);
-  
-  // Turn off motors - Initial state
-  digitalWrite(in1, LOW);
-  digitalWrite(in2, LOW);
-  digitalWrite(in3, LOW);
-  digitalWrite(in4, LOW);
+  pinMode(ENA, OUTPUT);
+  pinMode(ENB, OUTPUT);
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
 
   Serial.begin(57600);
   Wire.setClock(400000); // Set the clock speed of I2C
@@ -63,13 +58,13 @@ void setup() {
   delay(250);
 
   // Start the gyro in power mode
-  Wire.beginTransmission(0x68);
+  Wire.beginTransmission(IMU_ADDR);
   Wire.write(0x6B);
   Wire.write(0x00);
   Wire.endTransmission();
 
   // Perform the calibration measurements
-  for (RateCalibrationNumber=0; RateCalibrationNumber<2000;RateCalibrationNumber++) {
+  for (RateCalibrationNumber=0; RateCalibrationNumber<2000; RateCalibrationNumber++) {
     gyro_signals();
     RateCalibrationPitch += RatePitch;
     delay(1);
@@ -81,6 +76,8 @@ void setup() {
 }
 
 void loop() {
+  dt = (float)(micros() - LoopTimer) / MICROSECOND;
+
   gyro_signals();
   RatePitch -= RateCalibrationPitch;
   
@@ -91,54 +88,56 @@ void loop() {
 
   Serial.print("Pitch angle [°] = ");
   Serial.println(KalmanAnglePitch);
+  pid();
+  driveMotors();
   while (micros() - LoopTimer < 4000);
   LoopTimer = micros();
 }
 
 void gyro_signals(void) {
   // Switch on the low-pass filter
-  Wire.beginTransmission(0x68);
+  Wire.beginTransmission(IMU_ADDR);
   Wire.write(0x1A);
   Wire.write(0x05);
   Wire.endTransmission();
 
   // Configure the accelerometer output
-  Wire.beginTransmission(0x68);
+  Wire.beginTransmission(IMU_ADDR);
   Wire.write(0x1C);
   Wire.write(0x10);
   Wire.endTransmission();
 
   // Pull the accelerometer measurements from the sensor
-  Wire.beginTransmission(0x68);
+  Wire.beginTransmission(IMU_ADDR);
   Wire.write(0x3B);
   Wire.endTransmission();
 
-  Wire.requestFrom(0x68, 6);
+  Wire.requestFrom(IMU_ADDR, 6);
   int16_t AccXLSB = Wire.read() << 8 | Wire.read();
   int16_t AccYLSB = Wire.read() << 8 | Wire.read();
   int16_t AccZLSB = Wire.read() << 8 | Wire.read();
 
   // Set the sensitivity scale factor
-  Wire.beginTransmission(0x68);
+  Wire.beginTransmission(IMU_ADDR);
   Wire.write(0x1B);
   Wire.write(0x8);
   Wire.endTransmission();
 
   // Access registers storing gyro measurements
-  Wire.beginTransmission(0x68);
+  Wire.beginTransmission(IMU_ADDR);
   Wire.write(0x43);
   Wire.endTransmission();
 
-  Wire.requestFrom(0x68, 6);
+  Wire.requestFrom(IMU_ADDR, 6);
   int16_t GyroY = Wire.read() << 8 | Wire.read(); // Read the gyro measurements around the Y axis
 
   // Convert the measurement units to °/s
-  RatePitch = (float)GyroY/65.5;
+  RatePitch = (float) GyroY / 65.5;
 
   // Convert the measurements to physical values
-  AccX = (float)AccXLSB/4096 - 0.05;
-  AccY = (float)AccYLSB/4096 + 0.03;
-  AccZ = (float)AccZLSB/4096 - 0.03;
+  AccX = (float) AccXLSB / 4096 - 0.05;
+  AccY = (float) AccYLSB / 4096 + 0.03;
+  AccZ = (float) AccZLSB / 4096 - 0.03;
 
   // Calculate the absolute angle
   AnglePitch = -atan(AccX/sqrt(AccY*AccY + AccZ*AccZ)) * 1/(3.142/180); 
@@ -155,11 +154,34 @@ void kalman_1d(float KalmanState, float KalmanUncertainty, float KalmanInput, fl
   Kalman1DOutput[1] = KalmanUncertainty;
 }
 
-double pid(double error) {
-  double proportional = error;
+void pid(void) {
+  float error = (float)(-KalmanAnglePitch);
+
   integral += error * dt;
-  double derivative = (error - previous) / dt;
-  previous = error;
-  double output = (kp * proportional) + (ki * integral) + (kd * derivative);
-  return output;
+  integral = constrain(integral, -100, 100);
+
+  float derivative = (float)(error - prev_error) / dt;
+  prev_error = error;
+
+  throttle = (float)(kp * error + ki * integral + kd * derivative);
+
+  throttle = constrain(throttle, -255.0f, 255.0f);
+}
+
+void driveMotors() {
+  if (throttle > 0.0) {
+    digitalWrite(IN1, HIGH);
+    digitalWrite(IN2, LOW);
+    digitalWrite(IN3, HIGH);
+    digitalWrite(IN4, LOW);
+  } else {
+    digitalWrite(IN1, LOW);
+    digitalWrite(IN2, HIGH);
+    digitalWrite(IN3, LOW);
+    digitalWrite(IN4, HIGH);
+  }
+
+  float pwm = (float)abs(throttle);
+  analogWrite(ENA, pwm);
+  analogWrite(ENB, pwm);
 }
